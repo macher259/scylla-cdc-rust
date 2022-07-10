@@ -488,4 +488,84 @@ mod tests {
             );
         }
     }
+
+    struct FailingConsumer {
+        index: u32,
+        counter: Arc<Mutex<u32>>,
+    }
+
+    impl FailingConsumer {
+        fn new(index: u32, counter: Arc<Mutex<u32>>) -> FailingConsumer {
+            FailingConsumer { index, counter }
+        }
+    }
+
+    #[async_trait]
+    impl Consumer for FailingConsumer {
+        async fn consume_cdc(&mut self, _: CDCRow<'_>) -> Result<()> {
+            let mut cnt = self.counter.lock().await;
+            println!("{} took lock", self.index);
+            *cnt += 1;
+
+            if self.index % 2 == 0 && *cnt % self.index == 0 {
+                Ok(())
+            } else {
+                bail!("Self-induced error")
+            }
+        }
+    }
+
+    struct FailingConsumerFactory {
+        index_counter: Arc<Mutex<u32>>,
+        counter_for_consumers: Arc<Mutex<u32>>,
+    }
+
+    impl FailingConsumerFactory {
+        fn new() -> FailingConsumerFactory {
+            FailingConsumerFactory {
+                index_counter: Arc::new(Mutex::new(1)),
+                counter_for_consumers: Arc::new(Mutex::new(1)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ConsumerFactory for FailingConsumerFactory {
+        async fn new_consumer(&self) -> Box<dyn Consumer> {
+            let mut cnt = self.index_counter.lock().await;
+            println!("Factory took lock");
+
+            *cnt += 1;
+            Box::new(FailingConsumer::new(
+                *cnt,
+                self.counter_for_consumers.clone(),
+            ))
+        }
+    }
+
+    #[should_panic]
+    #[tokio::test]
+    async fn e2e_test_fail_some_consumers() {
+        let test = Test::new("fail_some_consumer", vec!["int"]).await.unwrap();
+
+        let factory = Arc::new(FailingConsumerFactory::new());
+
+        let end = now();
+
+        let (_tester, handle) = CDCLogReaderBuilder::new()
+            .session(Arc::clone(&test.session))
+            .keyspace(test.keyspace.as_str())
+            .table_name(test.table_name.as_str())
+            .start_timestamp(chrono::Duration::seconds(0))
+            .end_timestamp(end + chrono::Duration::seconds(2))
+            .window_size(time::Duration::from_millis(WINDOW_SIZE))
+            .safety_interval(time::Duration::from_millis(SAFETY_INTERVAL))
+            .sleep_interval(time::Duration::from_millis(SLEEP_INTERVAL))
+            .consumer_factory(factory)
+            .build()
+            .await
+            .expect("Creating cdc log printer failed!");
+
+        handle.await.unwrap();
+    }
 }
